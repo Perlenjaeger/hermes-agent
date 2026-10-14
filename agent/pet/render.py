@@ -21,7 +21,7 @@ from functools import lru_cache
 from itertools import groupby, takewhile
 from pathlib import Path
 
-from agent.pet.constants import DEFAULT_SCALE, FRAME_H, FRAME_W, FRAMES_PER_STATE, PetState, state_row_index
+from agent.pet.constants import DEFAULT_SCALE, FRAME_H, FRAME_W, FRAMES_PER_STATE, LOOP_MS, PetState, state_row_index
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,15 @@ def _encode_kitty_virtual(frame, *, image_id: int, cols: int, rows: int) -> str:
     return _kitty_apc(f"a=T,U=1,i={image_id},c={cols},r={rows},f=100,q=2", _png_b64(frame))
 
 
+def _encode_kitty_frame_switch(*, image_id: int, frame: int) -> str:
+    """``a=a,c=N``: make animation frame *frame* (1-based) the current one — control data only.
+
+    The terminal owns the uploaded frames and swaps the displayed one without any pixel
+    data moving, so animation never blanks the placement (see :meth:`PetRenderer.kitty_payload`).
+    """
+    return _kitty_apc(f"a=a,i={image_id},c={frame},q=2", "")
+
+
 def _encode_iterm(frame) -> str:
     """iTerm2 inline image (OSC 1337 File) pinned to the frame's cell box."""
     payload = _png_b64(frame)
@@ -308,14 +317,39 @@ class PetRenderer:
         frames = self._frames(state)
         return _downscale_cells(frames[index % len(frames)], target_cols=cols or self.unicode_cols) if frames else []
 
-    def kitty_payload(self, state: PetState | str, *, image_id: int) -> dict | None:
-        """kitty placeholder payload ``{cols, rows, placeholder, frames}`` (transmit escapes + static text grid); ``None`` if no frames."""
+    def kitty_payload(self, state: PetState | str, *, image_id: int, animate: bool = True) -> dict | None:
+        """kitty placeholder payload ``{cols, rows, placeholder, upload, frames}``; ``None`` if no frames.
+
+        Callers send ``upload`` ONCE (first sight of a state) and then one ``frames[index]``
+        escape per tick. Two shapes, selected by ``animate`` (the user's
+        ``display.pet.kitty_animation`` decision — whether the consuming terminal
+        implements the kitty animation sub-protocol is not probeable from inside a pane):
+
+        - ``animate=True``: ``upload`` is the frame set — base frame as the virtual
+          placement plus ``a=f`` animation frames — and each frame is a tiny ``a=a,c=N``
+          switch. Animation works by switching frames, never by re-transmitting pixel
+          data: re-sending data for a displayed image id blanks the placement until the
+          upload completes (visible flicker in multiplexers).
+        - ``animate=False`` (terminals without the animation sub-protocol):
+          ``upload`` is empty and each frame re-transmits its pixels on the same id
+          (``a=T,U=1``) — the pre-animation behaviour, steady where image replacement
+          is atomic and the only option where ``a=f``/``a=a`` would freeze on frame 1.
+        """
         if not (frames := self._frames(state)):
             return None
         frames = _fit_frames_to_cell_grid(frames)
         cols, rows = _cell_box(frames[0])
-        encoded = [_encode_kitty_virtual(f, image_id=image_id, cols=cols, rows=rows) for f in frames]
-        return {"cols": cols, "rows": rows, "placeholder": kitty_placeholder_rows(cols, rows), "frames": encoded}
+        if animate:
+            gap = max(1, int(LOOP_MS / max(1, len(frames))))
+            upload = _encode_kitty_virtual(frames[0], image_id=image_id, cols=cols, rows=rows) + "".join(
+                _kitty_apc(f"a=f,i={image_id},f=100,z={gap},q=2", _png_b64(f)) for f in frames[1:]
+            )
+            ticks = [_encode_kitty_frame_switch(image_id=image_id, frame=i + 1) for i in range(len(frames))]
+        else:
+            upload = ""
+            ticks = [_encode_kitty_virtual(f, image_id=image_id, cols=cols, rows=rows) for f in frames]
+        return {"cols": cols, "rows": rows, "placeholder": kitty_placeholder_rows(cols, rows),
+                "upload": upload, "frames": ticks}
 
     def frame(self, state: PetState | str, index: int) -> str:
         """Encoded escape string for one frame (``index`` taken modulo the frame count), or ``""``."""

@@ -212,21 +212,42 @@ def test_kitty_payload_structure(boba_like):
     image_id = render.kitty_image_id("boba")
     scale = 0.4
     r = render.PetRenderer(str(sprite), mode="kitty", scale=scale, unicode_cols=18)
-    payload = r.kitty_payload("run", image_id=image_id)
+    payload = r.kitty_payload("run", image_id=image_id, animate=True)
     assert payload is not None
     # Geometry is driven by the scaled/cropped sprite, not unicode_cols.
     assert payload["cols"] >= 1 and payload["rows"] >= 1
     assert payload["cols"] < 18  # 0.4 scale is much smaller than a pinned 18-col box
     # placeholder grid matches the requested geometry
     assert len(payload["placeholder"]) == payload["rows"]
-    # one transmit escape per animation frame, each a kitty virtual placement
-    assert len(payload["frames"]) == r.frame_count("run")
-    for esc in payload["frames"]:
+    # one tiny frame switch per animation frame (a=a,c=N — control only, no pixel data moves)
+    count = r.frame_count("run")
+    assert len(payload["frames"]) == count
+    for n, esc in enumerate(payload["frames"], start=1):
         assert esc.startswith("\x1b_G")
         assert esc.endswith("\x1b\\")
         assert f"i={image_id}" in esc
+        assert "a=a" in esc and f"c={n},q=2" in esc
+    # ... and one upload stream: base frame as the virtual placement, the rest as a=f frames
+    upload = payload["upload"]
+    assert "a=T" in upload and "U=1" in upload
+    assert upload.count("\x1b_Ga=f,") == max(0, count - 1)
+    assert f"c={payload['cols']}" in upload and f"r={payload['rows']}" in upload
+
+
+def test_kitty_payload_retransmit_fallback(boba_like):
+    # Terminals without the animation sub-protocol must get the
+    # pre-animation contract: no one-time upload, every tick re-transmits its frame.
+    sprite = store.load_pet("boba").spritesheet
+    image_id = render.kitty_image_id("boba:run")
+    r = render.PetRenderer(str(sprite), mode="kitty", scale=0.4, unicode_cols=18)
+    payload = r.kitty_payload("run", image_id=image_id, animate=False)
+    assert payload is not None
+    assert payload["upload"] == ""
+    assert len(payload["frames"]) == r.frame_count("run")
+    for esc in payload["frames"]:
         assert "a=T" in esc and "U=1" in esc
-        assert f"c={payload['cols']}" in esc and f"r={payload['rows']}" in esc
+        assert f"i={image_id}" in esc
+        assert "\x1b_Ga=f," not in esc and "a=a" not in esc
 
 
 
